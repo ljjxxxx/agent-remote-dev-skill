@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remote Dev"
+  short_description: "Sync local code and run on SSH hosts"
+  default_prompt: "Use $remote-dev to sync this local repo to my SSH server and run the requested tests remotely."
