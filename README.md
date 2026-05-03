@@ -55,7 +55,16 @@ Run the setup script locally. Use an absolute path so the command is safe to pas
 python3 ~/.codex/skills/remote-dev/scripts/configure_remote_dev.py --repo /absolute/path/to/project
 ```
 
-The script prompts locally for SSH host, port, user, password/key, and remote project path. It can set up passwordless SSH, a VS Code Remote-SSH compatible host entry, project-local `.remote-dev/bin/*` helpers, and optional Git hooks.
+The script prompts locally for only two values:
+
+```text
+SSH target or Host alias, e.g. root@1.2.3.4:22:
+Remote project directory, e.g. /root/my-project:
+```
+
+If passwordless SSH is not already available, it creates/reuses a remote-dev-managed key and lets `ssh-copy-id` prompt for the remote SSH password in the terminal. It does not collect passwords in chat or script variables.
+
+Setup also initializes local Git when needed, creates a VS Code Remote-SSH compatible host entry, makes raw `ssh -p <port> user@host` passwordless when possible, creates project-local `.remote-dev/bin/*` helpers, writes matching `AGENTS.md` and `CLAUDE.md` local guidance, installs Git hooks, runs a read-only remote audit, and applies the first non-deleting sync only when the audit finds no remote drift that needs review.
 
 Do not paste server passwords or private SSH configuration into Codex chat.
 
@@ -90,7 +99,7 @@ Generated Git hooks can automate that sync for manual Git operations.
 
 ## Remote Files And Data
 
-`remote-sync` uploads the local Git view: tracked files plus unignored untracked files. Local control files such as `.remote-dev/`, `.remoteignore`, and `AGENTS.md` are excluded.
+`remote-sync` uploads the local Git view: tracked files plus unignored untracked files. Local control files such as `.remote-dev/`, `.remoteignore`, `.hermes/`, `.codex/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` are excluded.
 
 Keep remote-only data, checkpoints, caches, logs, and environments in `.gitignore`. If Codex should see the directory shape locally, create empty placeholder directories with `.gitkeep`.
 
@@ -109,7 +118,8 @@ Remote servers may not have public internet access. The skill includes mirror-aw
 
 Local machine:
 
-- Python 3
+- Python 3.7+
+- `bash`
 - `ssh`
 - `rsync`
 - Git
@@ -117,9 +127,9 @@ Local machine:
 Remote server:
 
 - SSH access
+- `bash` (helpers run `bash -lc ...`)
 - `rsync`
-- POSIX shell tools
-- `screen` for background jobs, or `tmux` for legacy usage
+- `screen` for background jobs (preferred), or `tmux` for legacy usage
 
 ## Development
 

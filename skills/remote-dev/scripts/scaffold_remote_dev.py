@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create project-local helper scripts for local Codex + remote SSH execution."""
+"""Create project-local helper scripts for the local agent (Hermes/Codex/Claude Code) + remote SSH execution."""
 
 from __future__ import annotations
 
@@ -19,12 +19,15 @@ CONFIG_EXAMPLE_PATH = ".remote-dev/config.example"
 REMOTEIGNORE = """\
 # Optional extra excludes for legacy/manual rsync-style operations.
 # Default upload is driven by Git's tracked/unignored file view.
+.hermes/
 .codex/
+.claude/
 .agents/
 .remote-dev/
 .remote-dev.env
 .remoteignore
 AGENTS.md
+CLAUDE.md
 """
 
 
@@ -54,7 +57,7 @@ filter_manifest() {
   while IFS= read -r -d '' path; do
     path="${path#./}"
     case "$path" in
-      ""|.git/*|.codex/*|.agents/*|.remote-dev/*|.remote-dev.env|.remoteignore|AGENTS.md)
+      ""|.git/*|.hermes/*|.codex/*|.claude/*|.agents/*|.remote-dev/*|.remote-dev.env|.remoteignore|AGENTS.md|CLAUDE.md)
         continue
         ;;
     esac
@@ -215,6 +218,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONFIG="${REMOTE_DEV_CONFIG:-$ROOT/.remote-dev/config}"
+DRY_RUN_CACHE="$ROOT/.remote-dev/cache/remote-pull-dry-run"
 APPLY=0
 
 usage() {
@@ -293,7 +297,7 @@ for path in "$@"; do
       echo "Refusing whole-tree pull. Pass explicit file paths." >&2
       exit 2
       ;;
-    .git|.git/*|.remote-dev|.remote-dev/*|.remoteignore|AGENTS.md)
+    .git|.git/*|.remote-dev|.remote-dev/*|.remoteignore|AGENTS.md|CLAUDE.md|.hermes|.hermes/*|.codex|.codex/*|.claude|.claude/*|.agents|.agents/*)
       echo "Refusing to pull local-control path: $clean_path" >&2
       exit 2
       ;;
@@ -302,9 +306,286 @@ for path in "$@"; do
   if ! ssh "${REMOTE_SSH_OPTS[@]}" "$REMOTE_HOST" "test -e $REMOTE_ROOT_Q/$CLEAN_PATH_Q"; then
     continue
   fi
-  mkdir -p "$ROOT/$(dirname "$clean_path")"
-  rsync "${RSYNC_ARGS[@]}" -e "$SSH_CMD" "$REMOTE_HOST:$REMOTE_ROOT/$clean_path" "$ROOT/$clean_path"
+
+  dest="$ROOT/$clean_path"
+  if [[ "$APPLY" -eq 1 ]]; then
+    mkdir -p "$ROOT/$(dirname "$clean_path")"
+  elif [[ ! -d "$ROOT/$(dirname "$clean_path")" ]]; then
+    dest="$DRY_RUN_CACHE/$clean_path"
+    mkdir -p "$(dirname "$dest")"
+  fi
+
+  rsync "${RSYNC_ARGS[@]}" -e "$SSH_CMD" "$REMOTE_HOST:$REMOTE_ROOT/$clean_path" "$dest"
 done
+"""
+
+
+REMOTE_AUDIT = """\
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CONFIG="${REMOTE_DEV_CONFIG:-$ROOT/.remote-dev/config}"
+CACHE_DIR="$ROOT/.remote-dev/cache"
+MANIFEST_Z="$CACHE_DIR/audit-files.z"
+MANIFEST="$CACHE_DIR/audit-files.txt"
+LOCAL_PATHS="$CACHE_DIR/audit-local-paths.txt"
+RSYNC_OUT="$CACHE_DIR/audit-rsync.txt"
+LOCAL_ADDITIONS="$CACHE_DIR/audit-local-additions.txt"
+CONTENT_CHANGES="$CACHE_DIR/audit-content-changes.txt"
+METADATA_CHANGES="$CACHE_DIR/audit-metadata-changes.txt"
+REMOTE_ENTRIES="$CACHE_DIR/audit-remote-entries.txt"
+REMOTE_ONLY="$CACHE_DIR/audit-remote-only.txt"
+REMOTE_ONLY_RUNTIME_CANDIDATES="$CACHE_DIR/audit-remote-only-runtime-candidates.txt"
+REMOTE_ONLY_REVIEW="$CACHE_DIR/audit-remote-only-review.txt"
+LIMIT=200
+DEPTH=3
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  .remote-dev/bin/remote-audit [--depth N] [--limit N]
+
+Read-only audit for an existing remote project directory. It does not modify
+local project files or remote files. Exit code 10 means differences need review
+before applying sync, pull, or delete actions.
+USAGE
+}
+
+filter_manifest() {
+  while IFS= read -r -d '' path; do
+    path="${path#./}"
+    case "$path" in
+      ""|.git/*|.hermes/*|.codex/*|.claude/*|.agents/*|.remote-dev/*|.remote-dev.env|.remoteignore|AGENTS.md|CLAUDE.md)
+        continue
+        ;;
+    esac
+    printf '%s\\0' "$path"
+  done
+}
+
+is_git_root() {
+  command -v git >/dev/null 2>&1 \
+    && git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    && [[ -z "$(git -C "$ROOT" rev-parse --show-prefix)" ]]
+}
+
+build_manifest() {
+  mkdir -p "$CACHE_DIR"
+  local tmp="$MANIFEST_Z.tmp"
+  if is_git_root; then
+    git -C "$ROOT" ls-files -co --exclude-standard -z | filter_manifest > "$tmp"
+  else
+    echo "Warning: $ROOT is not a Git worktree root; auditing local files except remote-dev control files." >&2
+    (cd "$ROOT" && find . -type f -print0) | filter_manifest > "$tmp"
+  fi
+  mv "$tmp" "$MANIFEST_Z"
+  tr '\\0' '\\n' < "$MANIFEST_Z" > "$MANIFEST"
+}
+
+build_local_paths() {
+  : > "$LOCAL_PATHS.tmp"
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    printf '%s\n' "$path" >> "$LOCAL_PATHS.tmp"
+    local dir
+    dir="$(dirname "$path")"
+    while [[ "$dir" != "." && "$dir" != "/" ]]; do
+      printf '%s\n' "$dir" >> "$LOCAL_PATHS.tmp"
+      dir="$(dirname "$dir")"
+    done
+  done < "$MANIFEST"
+  LC_ALL=C sort -u "$LOCAL_PATHS.tmp" > "$LOCAL_PATHS"
+  rm -f "$LOCAL_PATHS.tmp"
+}
+
+count_lines() {
+  if [[ -f "$1" ]]; then
+    wc -l < "$1" | tr -d ' '
+  else
+    printf '0'
+  fi
+}
+
+show_sample() {
+  local file="$1"
+  local lines="${2:-40}"
+  if [[ -s "$file" ]]; then
+    sed -n "1,${lines}p" "$file"
+  else
+    echo "(none)"
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --depth)
+      DEPTH="${2:-}"
+      shift 2
+      ;;
+    --limit)
+      LIMIT="${2:-}"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ ! "$DEPTH" =~ ^[0-9]+$ || "$DEPTH" -lt 1 ]]; then
+  echo "--depth must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$LIMIT" =~ ^[0-9]+$ || "$LIMIT" -lt 1 ]]; then
+  echo "--limit must be a positive integer" >&2
+  exit 2
+fi
+
+if [[ ! -f "$CONFIG" ]]; then
+  echo "Missing remote config: $CONFIG" >&2
+  echo "Run the remote-dev configure script or create it from .remote-dev/config.example." >&2
+  exit 2
+fi
+
+# shellcheck source=/dev/null
+source "$CONFIG"
+: "${REMOTE_HOST:?Set REMOTE_HOST in .remote-dev/config}"
+: "${REMOTE_ROOT:?Set REMOTE_ROOT in .remote-dev/config}"
+
+if ! declare -p REMOTE_SSH_OPTS >/dev/null 2>&1; then
+  REMOTE_SSH_OPTS=(
+    -o ServerAliveInterval=30
+  )
+fi
+
+SSH_CMD="ssh"
+for opt in "${REMOTE_SSH_OPTS[@]}"; do
+  SSH_CMD+=" $(printf "%q" "$opt")"
+done
+
+printf -v REMOTE_ROOT_Q "%q" "$REMOTE_ROOT"
+printf -v DEPTH_Q "%q" "$DEPTH"
+printf -v LIMIT_Q "%q" "$LIMIT"
+
+if ! ssh "${REMOTE_SSH_OPTS[@]}" "$REMOTE_HOST" "test -d $REMOTE_ROOT_Q"; then
+  echo "Remote project directory does not exist: $REMOTE_HOST:$REMOTE_ROOT" >&2
+  echo "remote-audit is read-only and will not create it." >&2
+  exit 20
+fi
+
+build_manifest
+build_local_paths
+
+rsync -azcni --from0 --files-from "$MANIFEST_Z" -e "$SSH_CMD" "$ROOT/" "$REMOTE_HOST:$REMOTE_ROOT/" > "$RSYNC_OUT"
+
+awk '
+  NF == 0 { next }
+  {
+    item = $1
+    type = substr(item, 2, 1)
+    if ((type == "f" || type == "L") && index(item, "+") > 0) {
+      print
+    }
+  }
+' "$RSYNC_OUT" > "$LOCAL_ADDITIONS"
+
+awk '
+  NF == 0 { next }
+  {
+    item = $1
+    type = substr(item, 2, 1)
+    if ((type == "f" || type == "L") && index(item, "+") == 0 && (substr(item, 3, 1) == "c" || substr(item, 4, 1) == "s")) {
+      print
+    }
+  }
+' "$RSYNC_OUT" > "$CONTENT_CHANGES"
+
+awk '
+  NF == 0 { next }
+  {
+    item = $1
+    type = substr(item, 2, 1)
+    if (!((type == "f" || type == "L") && (index(item, "+") > 0 || substr(item, 3, 1) == "c" || substr(item, 4, 1) == "s"))) {
+      print
+    }
+  }
+' "$RSYNC_OUT" > "$METADATA_CHANGES"
+
+ssh "${REMOTE_SSH_OPTS[@]}" "$REMOTE_HOST" "cd $REMOTE_ROOT_Q && find . -mindepth 1 -maxdepth $DEPTH_Q \\
+  \\( -path './.git' -o -path './.git/*' -o -path './.remote-dev' -o -path './.remote-dev/*' \\) -prune -o -print \
+  | sed 's#^\\./##' | LC_ALL=C sort | head -n $LIMIT_Q" > "$REMOTE_ENTRIES"
+
+comm -23 "$REMOTE_ENTRIES" "$LOCAL_PATHS" > "$REMOTE_ONLY" || true
+# Heuristic only: these names look like runtime/data artifacts. Review unexpected paths before acting.
+RUNTIME_RE='(^|/)(\.venv|venv|node_modules|outputs?|data|datasets?|restructured_data|checkpoints?|lightning_logs|tb_logs|tensorboard|wandb|logs|runs|\.cache)(/|$)'
+grep -E "$RUNTIME_RE" "$REMOTE_ONLY" > "$REMOTE_ONLY_RUNTIME_CANDIDATES" || true
+grep -Ev "$RUNTIME_RE" "$REMOTE_ONLY" > "$REMOTE_ONLY_REVIEW" || true
+
+addition_count="$(count_lines "$LOCAL_ADDITIONS")"
+content_count="$(count_lines "$CONTENT_CHANGES")"
+metadata_count="$(count_lines "$METADATA_CHANGES")"
+remote_only_count="$(count_lines "$REMOTE_ONLY")"
+runtime_count="$(count_lines "$REMOTE_ONLY_RUNTIME_CANDIDATES")"
+review_count="$(count_lines "$REMOTE_ONLY_REVIEW")"
+
+cat <<SUMMARY
+Remote drift audit (read-only)
+Remote: $REMOTE_HOST:$REMOTE_ROOT
+Local:  $ROOT
+Manifest files: $(count_lines "$MANIFEST")
+
+Local -> remote checksum dry-run:
+  new files to upload:                         $addition_count
+  content changes to existing remote files:    $content_count
+  metadata/time/dir-only entries: $metadata_count
+
+Remote-only entries from shallow listing (depth <= $DEPTH, limit $LIMIT):
+  looks runtime/data-like candidates: $runtime_count
+  other review candidates:           $review_count
+  total sample:                      $remote_only_count
+SUMMARY
+
+echo ""
+echo "New local files that would be uploaded:"
+show_sample "$LOCAL_ADDITIONS" 80
+
+echo ""
+echo "Content changes to existing remote files:"
+show_sample "$CONTENT_CHANGES" 80
+
+echo ""
+echo "Remote-only review candidates not matched by the runtime/data heuristic:"
+show_sample "$REMOTE_ONLY_REVIEW" 80
+
+echo ""
+echo "Remote-only entries that look runtime/data-like (heuristic candidates, not a decision):"
+show_sample "$REMOTE_ONLY_RUNTIME_CANDIDATES" 80
+
+echo ""
+echo "Audit artifacts written under: $CACHE_DIR"
+cat <<'NEXT'
+
+Next steps:
+- Treat candidate categories as evidence, not decisions. Inspect unexpected paths before acting.
+- If remote contains desired source changes, inspect explicit files and use:
+    .remote-dev/bin/remote-pull path
+    .remote-dev/bin/remote-pull --apply path
+- If local should replace remote source, get user approval, then run:
+    .remote-dev/bin/remote-sync
+- For cleanup, dry-run deletion first and get explicit approval:
+    .remote-dev/bin/remote-sync --dry-run --delete
+NEXT
+
+if [[ "$content_count" -gt 0 || "$review_count" -gt 0 || "$runtime_count" -gt 0 ]]; then
+  exit 10
+fi
 """
 
 
@@ -377,7 +658,7 @@ done
 
 cat <<'NOTE'
 Note: Git has no standard post-push hook. pre-push keeps remote runtime state current before manual pushes.
-When Codex runs git push, it should still run .remote-dev/bin/remote-sync after a successful push.
+When the agent runs git push, it should still run .remote-dev/bin/remote-sync after a successful push.
 NOTE
 """
 
@@ -660,8 +941,8 @@ This repository is edited locally and runs on an SSH host. The remote checkout i
 
 - Git decisions stay on the local checkout. Run `git status`, `git diff`, `git add`, `git commit`, `git branch`, `git merge`, `git pull`, and `git push` locally unless explicitly instructed otherwise for one command.
 - The remote also receives a synced `.git/` directory so runtime tools can read commit/branch state with commands like `git rev-parse`, but do not commit, pull, push, branch, or merge on the remote by default.
-- After Codex performs local Git state changes, run `.remote-dev/bin/remote-sync` before continuing. This includes successful `git commit`, `git merge`, `git rebase`, `git checkout`, `git switch`, `git pull`, and successful `git push` even if the user may or may not push.
-- Local Git hooks may also run `.remote-dev/bin/remote-sync` after manual Git operations. Git has no standard `post-push` hook, so the generated `pre-push` hook syncs before manual pushes; Codex should still sync after a successful `git push`.
+- After the agent (Hermes/Codex/Claude Code) performs local Git state changes, run `.remote-dev/bin/remote-sync` before continuing. This includes successful `git commit`, `git merge`, `git rebase`, `git checkout`, `git switch`, `git pull`, and successful `git push` even if the user may or may not push.
+- Local Git hooks may also run `.remote-dev/bin/remote-sync` after manual Git operations. Git has no standard `post-push` hook, so the generated `pre-push` hook syncs before manual pushes; the agent should still sync after a successful `git push`.
 - Runtime environment operations stay on the remote host. Run tests, builds, scripts, services, training, dependency installs, lockfile generation, and virtual environment changes through `.remote-dev/bin/remote-run`.
 - Remote project commands must run from the remote project directory. The generated tools `cd` to `REMOTE_ROOT` before running project commands.
 - Remote project-local environments are preferred automatically: if `.venv/bin`, `venv/bin`, or `node_modules/.bin` exists under `REMOTE_ROOT`, it is prepended to `PATH` before the command runs. Set `REMOTE_USE_PROJECT_ENV=0` in `.remote-dev/config` to disable.
@@ -670,11 +951,12 @@ This repository is edited locally and runs on an SSH host. The remote checkout i
 - Create or modify runtime environments only on the remote host via `.remote-dev/bin/remote-run`. This includes `uv`, `pip`, `conda`, `npm`, virtualenv creation, dependency installs/upgrades/removals, and lockfile generation. Do not create local `.venv` or install project dependencies locally unless explicitly requested.
 - Foreground `.remote-dev/bin/remote-run` auto-pulls common metadata/lock files changed by remote tooling, such as `pyproject.toml` and `uv.lock`. Use `--no-pull` to disable or `REMOTE_PULL_PATHS=(...)` in `.remote-dev/config` to customize.
 - Use `.remote-dev/bin/remote-pull [path ...]` for manual dry-run remote-to-local pulls; add `--apply` after reviewing.
+- Use `.remote-dev/bin/remote-audit` before the first sync to an existing or unknown remote project directory. Its path/name categories are heuristic candidates only. If it reports content drift or remote-only candidates, summarize the files and get user approval before pulling, syncing, editing ignore rules, or deleting.
 - Use `.remote-dev/bin/remote-run <command>` for commands that need remote datasets, GPUs, services, or credentials.
 - Use `.remote-dev/bin/remote-run --screen <session> -- <command>` for long-running jobs. Use `--tmux` only for legacy tmux sessions.
 - Use `.remote-dev/bin/remote-logs <session> [lines]` to inspect long-running output.
 - Treat `.remote-dev/config` as local private configuration. Do not print it or paste its contents unless debugging requires it.
-- Keep local control files local: `.remote-dev/`, `.remoteignore`, and `AGENTS.md` are not uploaded to the remote and should be ignored by local Git.
+- Keep local control files local: `.remote-dev/`, `.remoteignore`, `.hermes/`, `AGENTS.md`, and `CLAUDE.md` are not uploaded to the remote and should be ignored by local Git.
 - Represent remote-only directories locally with empty placeholder directories. When a project uses a remote-only directory, create the empty local directory with `.gitkeep` or a similar placeholder and add matching `.gitignore` rules such as `path/*` and `!path/.gitkeep`.
 - Put datasets, environment directories, caches, logs, checkpoints, and generated artifacts in `.gitignore`. Do not rely on `.remoteignore` as the main safety mechanism.
 - When installing or downloading dependencies on the remote server, assume public internet may be blocked or slow. Prefer existing configured mirrors first; otherwise use China-accessible mirrors such as Aliyun, Tsinghua, USTC, or HuaweiCloud, or a user-provided transit host.
@@ -707,7 +989,7 @@ def append_once(path: Path, marker: str, content: str) -> str:
 def tracked_local_control_files(repo: Path) -> list[str]:
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo), "ls-files", "--", ".remote-dev", ".remoteignore", "AGENTS.md"],
+            ["git", "-C", str(repo), "ls-files", "--", ".remote-dev", ".remoteignore", ".hermes", "AGENTS.md", "CLAUDE.md"],
             text=True,
             capture_output=True,
             check=False,
@@ -742,7 +1024,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--host", help="SSH config alias or host")
     parser.add_argument("--remote-root", help="remote repository path")
     parser.add_argument("--force", action="store_true", help="overwrite existing generated files")
-    parser.add_argument("--no-agents", action="store_true", help="do not append AGENTS.md guidance")
+    parser.add_argument("--no-agents", action="store_true", help="do not append AGENTS.md or CLAUDE.md guidance")
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).expanduser().resolve()
@@ -763,6 +1045,7 @@ def main(argv: list[str]) -> int:
 
     results.append(write_file(repo / BIN_DIR / "remote-sync", REMOTE_SYNC, True, args.force))
     results.append(write_file(repo / BIN_DIR / "remote-pull", REMOTE_PULL, True, args.force))
+    results.append(write_file(repo / BIN_DIR / "remote-audit", REMOTE_AUDIT, True, args.force))
     results.append(write_file(repo / BIN_DIR / "install-git-hooks", INSTALL_GIT_HOOKS, True, args.force))
     results.append(write_file(repo / BIN_DIR / "remote-run", REMOTE_RUN, True, args.force))
     results.append(write_file(repo / BIN_DIR / "remote-shell", REMOTE_SHELL, True, args.force))
@@ -772,7 +1055,7 @@ def main(argv: list[str]) -> int:
         append_once(
             repo / ".gitignore",
             "# remote-dev local control files",
-            "# remote-dev local control files\n.remote-dev/\n.remoteignore\nAGENTS.md",
+            "# remote-dev local control files\n.remote-dev/\n.remoteignore\n.hermes/\nAGENTS.md\nCLAUDE.md",
         )
     )
     tracked_control = tracked_local_control_files(repo)
@@ -784,6 +1067,7 @@ def main(argv: list[str]) -> int:
 
     if not args.no_agents:
         results.append(append_once(repo / "AGENTS.md", "## Remote Development", AGENTS_SNIPPET))
+        results.append(append_once(repo / "CLAUDE.md", "## Remote Development", AGENTS_SNIPPET))
 
     for result in results:
         print(result)
