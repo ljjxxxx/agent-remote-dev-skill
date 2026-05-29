@@ -22,10 +22,12 @@ import sys
 DEFAULT_SSH_OPTS = [
     "-o",
     "ServerAliveInterval=30",
+    "-o",
+    "ConnectTimeout=10",
 ]
 
-MARKER_PREFIX = "# >>> codex-remote-dev "
-MARKER_SUFFIX = "# <<< codex-remote-dev "
+MARKER_PREFIX = "# >>> remote-dev "
+MARKER_SUFFIX = "# <<< remote-dev "
 
 
 @dataclass
@@ -380,7 +382,7 @@ def ensure_key(key_path: Path, label: str) -> None:
     if key_path.exists():
         print(f"Using existing key: {key_path}")
         return
-    run(["ssh-keygen", "-t", "ed25519", "-f", str(key_path), "-N", "", "-C", f"codex-remote-dev {label}"])
+    run(["ssh-keygen", "-t", "ed25519", "-f", str(key_path), "-N", "", "-C", f"remote-dev {label}"])
 
 
 def ssh_opts_for_direct(port: str, key_path: Path | None = None) -> list[str]:
@@ -434,28 +436,57 @@ def format_bash_array(values: list[str]) -> str:
     return "\n".join(lines)
 
 
+def read_config_extras(config: Path) -> dict[str, str]:
+    """Capture user customizations so reconfigure does not silently drop them."""
+    extras: dict[str, str] = {}
+    if not config.exists():
+        return extras
+    lines = config.read_text(encoding="utf-8", errors="ignore").splitlines()
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped.startswith("REMOTE_INIT="):
+            extras["remote_init"] = lines[i]
+        elif stripped.startswith("REMOTE_USE_PROJECT_ENV="):
+            extras["use_project_env"] = stripped.split("=", 1)[1].strip()
+        elif stripped.startswith("REMOTE_PULL_PATHS=("):
+            block = [lines[i]]
+            while ")" not in lines[i] and i + 1 < len(lines):
+                i += 1
+                block.append(lines[i])
+            extras["pull_paths_block"] = "\n".join(block)
+        i += 1
+    return extras
+
+
 def write_project_config(repo: Path, conn: SshConnection, remote_root: str) -> None:
     config = repo / ".remote-dev" / "config"
     config.parent.mkdir(parents=True, exist_ok=True)
-    content = "\n".join(
-        [
-            f"REMOTE_HOST={shlex.quote(conn.remote_host)}",
-            f"REMOTE_ROOT={shlex.quote(remote_root)}",
-            format_bash_array(conn.ssh_opts),
-            "# Prefer project-local remote environments under REMOTE_ROOT:",
-            "# .venv/bin, venv/bin, and node_modules/.bin.",
-            "REMOTE_USE_PROJECT_ENV=1",
-            "",
-        ]
-    )
-    config.write_text(content, encoding="utf-8")
+    extras = read_config_extras(config)
+    lines = [
+        f"REMOTE_HOST={shlex.quote(conn.remote_host)}",
+        f"REMOTE_ROOT={shlex.quote(remote_root)}",
+        format_bash_array(conn.ssh_opts),
+        "# Prefer project-local remote environments under REMOTE_ROOT:",
+        "# .venv/bin, venv/bin, and node_modules/.bin.",
+        f"REMOTE_USE_PROJECT_ENV={extras.get('use_project_env', '1')}",
+    ]
+    if "remote_init" in extras:
+        lines.append(extras["remote_init"])
+    if "pull_paths_block" in extras:
+        lines.append(extras["pull_paths_block"])
+    lines.append("")
+    config.write_text("\n".join(lines), encoding="utf-8")
     config.chmod(0o600)
-    print(f"Wrote {config}")
+    if extras:
+        print(f"Wrote {config} (kept existing REMOTE_INIT/REMOTE_PULL_PATHS/REMOTE_USE_PROJECT_ENV)")
+    else:
+        print(f"Wrote {config}")
 
 
 def default_key_path(target: SshTarget) -> Path:
     label = target.alias or f"{target.user}_{target.host}_{target.port}"
-    return Path.home() / ".ssh" / f"codex_remote_dev_{safe_token(label)}"
+    return Path.home() / ".ssh" / f"remote_dev_{safe_token(label)}"
 
 
 def detect_or_setup_connection(target: SshTarget) -> SshConnection:
@@ -503,7 +534,7 @@ def detect_or_setup_connection(target: SshTarget) -> SshConnection:
     direct_opts = ssh_opts_for_direct(port)
     if test_ssh(ssh_target, direct_opts):
         print("Direct passwordless SSH already works. No new key needed.")
-        alias = unique_alias(f"codex-{safe_token(user)}-{safe_token(host)}-{safe_token(port)}")
+        alias = unique_alias(f"remote-dev-{safe_token(user)}-{safe_token(host)}-{safe_token(port)}")
         write_vscode_host(alias, host, port, user, None)
         return SshConnection(remote_host=alias, ssh_opts=DEFAULT_SSH_OPTS, vscode_host=alias)
 
@@ -514,7 +545,7 @@ def detect_or_setup_connection(target: SshTarget) -> SshConnection:
         install_public_key(ssh_target, port, key_path)
     if not test_ssh(ssh_target, keyed_opts):
         raise SystemExit("Passwordless SSH still failed. Check server SSH settings and try again.")
-    alias = unique_alias(f"codex-{safe_token(user)}-{safe_token(host)}-{safe_token(port)}")
+    alias = unique_alias(f"remote-dev-{safe_token(user)}-{safe_token(host)}-{safe_token(port)}")
     write_vscode_host(alias, host, port, user, key_path)
     if not test_ssh(alias, DEFAULT_SSH_OPTS):
         raise SystemExit(f"Created SSH host '{alias}', but passwordless test failed.")
@@ -550,7 +581,7 @@ def main(argv: list[str]) -> int:
     run(["ssh", *conn.ssh_opts, conn.remote_host, f"mkdir -p '{remote_root_q}'"])
 
     scaffold = Path(__file__).with_name("scaffold_remote_dev.py")
-    run([sys.executable, str(scaffold), "--repo", str(repo), "--host", conn.remote_host, "--remote-root", remote_root])
+    run([sys.executable, str(scaffold), "--repo", str(repo), "--host", conn.remote_host, "--remote-root", remote_root, "--force-helpers"])
     write_project_config(repo, conn, remote_root)
 
     if conn.key_path is not None and target.raw_matchable:

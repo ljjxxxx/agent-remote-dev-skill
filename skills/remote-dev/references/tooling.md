@@ -6,7 +6,7 @@ Core split: Git decisions live on the local checkout; runtime state lives on the
 
 When attaching remote-dev to an existing remote project directory, first do a read-only drift audit. Existing remote source files may contain user work. Do not apply the first sync, pull remote files into local, or delete remote paths until the differences are summarized and the user chooses a direction.
 
-Default upload is Git-view based. `remote-sync` builds a local file list from `git ls-files -co --exclude-standard` when the project root is a Git worktree root, then filters local control files such as `.remote-dev/`, `.remoteignore`, `.hermes/`, `AGENTS.md`, and `CLAUDE.md`. It also syncs local `.git/` to remote so runtime tools can read commit/branch state. Remote `.git/` is a copied runtime view, not a place for default Git decisions.
+Default upload is Git-view based. `remote-sync` builds a local file list from `git ls-files -co --exclude-standard` when the project root is a Git worktree root, then filters local control paths such as `.remote-dev/`, `.hermes/`, `.codex/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md`, and drops manifest entries that no longer exist on disk (for example a tracked file deleted from the working tree). `AGENTS.md` and `CLAUDE.md` are always filtered from the upload (not only gitignored), so local notes never reach the remote. `remote-sync` also syncs local `.git/` to remote so runtime tools can read commit/branch state. Remote `.git/` is a copied runtime view, not a place for default Git decisions.
 
 After local Git state changes, sync the remote runtime copy with `.remote-dev/bin/remote-sync`. This applies after successful local `git commit`, `git merge`, `git rebase`, `git checkout`, `git switch`, `git pull`, and successful `git push`. Git has no standard `post-push` hook, so generated hooks use `pre-push` for manual pushes; when the agent runs `git push`, run `remote-sync` again after the push succeeds.
 
@@ -24,7 +24,7 @@ checkpoints/*
 
 - `.remote-dev/config`: Local shell config with `REMOTE_HOST`, `REMOTE_ROOT`, and optional `REMOTE_SSH_OPTS`. Keep it out of git.
 - `.remote-dev/config.example`: Template config safe to commit.
-- `.remoteignore`: Local-only optional extra excludes for legacy/manual rsync-style operations. It is ignored by local Git and is not uploaded.
+- `.remote-dev/version`: Records the scaffold version that generated the helpers. Re-running the configure script refreshes the helpers and updates this stamp.
 - `.remote-dev/bin/remote-sync`: Sync local repo contents to the remote root.
 - `.remote-dev/bin/install-git-hooks`: Install local Git hooks that run `remote-sync` after manual Git operations. Existing unmanaged hooks are skipped.
 - `.remote-dev/bin/remote-pull`: Path-scoped dry-run remote-to-local pulls; use `--apply` after review.
@@ -32,16 +32,18 @@ checkpoints/*
 - `.remote-dev/bin/remote-run`: Sync, run under the remote root, then auto-pull allowlisted metadata/lock files for foreground commands.
 - `.remote-dev/bin/remote-shell`: Open a shell in the remote root or run one remote command.
 - `.remote-dev/bin/remote-logs`: Tail a `screen`/`tmux` session log file.
+- `.remote-dev/bin/remote-forward`: Forward a local port to a service running on the remote host (Jupyter, TensorBoard, dev server, API).
 - `.remote-dev/cache/sync-files.txt`: Local-only record of the current upload manifest.
 
 ## Command Contracts
 
-- `remote-sync [--dry-run] [--delete]`: local -> remote. Uploads the Git-view manifest and a copied `.git/` runtime view. It never pulls remote files back. Without `--delete`, it does not delete remote files. With `--delete`, dry-run first and confirm; deletion is limited to paths from the previous local sync manifest.
-- `remote-run [--no-sync] [--no-pull] [--screen NAME|--tmux NAME] [--tty] --? command...`: syncs by default, then runs `command` after `cd "$REMOTE_ROOT"` on the remote. Foreground commands auto-pull allowlisted metadata/lock files unless `--no-pull` is set. `--screen`/`--tmux` starts a background job and does not auto-pull.
-- `remote-pull [--apply] path...`: remote -> local, explicit paths only. Default is dry-run. Use it only for intentional remote-generated files such as lockfiles/configs. It refuses whole-tree pulls and local-control paths such as `.git/`, `.remote-dev/`, `.remoteignore`, `.hermes/`, `AGENTS.md`, and `CLAUDE.md`.
+- `remote-sync [--dry-run] [--delete [--yes]]`: local -> remote. Uploads the Git-view manifest and a copied `.git/` runtime view. It never pulls remote files back. Without `--delete`, it does not delete remote files. `--delete` previews the removals and asks for confirmation, refusing in non-interactive runs unless `--yes` is given; deletion is limited to paths from the previous local sync manifest.
+- `remote-run [--no-sync] [--no-pull] [--screen NAME|--tmux NAME] [--tty] --? command...`: syncs by default, then runs `command` after `cd "$REMOTE_ROOT"` on the remote. A single quoted argument runs as a remote shell command, so `&&`, `|`, `>`, and `;` work; multiple arguments run literally without shell interpretation. Foreground commands auto-pull allowlisted metadata/lock files unless `--no-pull` is set. `--screen`/`--tmux` starts a background job and does not auto-pull.
+- `remote-pull [--apply] path...`: remote -> local, explicit paths only. Default is dry-run. It resolves which requested paths exist on the remote in a single SSH round-trip, then pulls those. Use it only for intentional remote-generated files such as lockfiles/configs. It refuses whole-tree pulls, absolute paths, any path containing `..` (so a pull cannot escape the remote project root), and agent control paths such as `.git/`, `.remote-dev/`, `.hermes/`, `.codex/`, `.claude/`, and `.agents/`.
 - `remote-audit [--depth N] [--limit N]`: read-only local/remote drift audit. It uses the local Git-view manifest, checksum rsync dry-run, and shallow remote listing. Name/path classifications are heuristic only. Exit code `10` means differences or remote-only candidates need review before applying sync/pull/delete.
 - `remote-shell [command...]`: opens or runs a remote shell after `cd "$REMOTE_ROOT"` and project-local environment PATH setup. Use for inspection, not for local Git decisions.
 - `remote-logs NAME [lines]`: shows recent log output from a named `screen`/`tmux` job; keep `lines` modest.
+- `remote-forward [-f] PORT | LPORT:RPORT | LPORT:RHOST:RPORT`: forwards a local port to a remote service over SSH. Foreground by default (Ctrl-C to stop); `-f` runs it in the background (`ssh -fN`) and prints how to stop it.
 - `install-git-hooks`: local only. Installs managed hooks that run `remote-sync` after manual Git operations. It skips unmanaged existing hooks.
 
 If behavior matters for a risky operation, inspect the project-local script in `.remote-dev/bin/` because it is the version that will actually run.
@@ -101,8 +103,11 @@ REMOTE_USE_PROJECT_ENV=0
 .remote-dev/bin/remote-run pytest tests/test_file.py -q
 .remote-dev/bin/remote-run --no-sync python scripts/check_gpu.py
 .remote-dev/bin/remote-run --screen train -- python train.py --config configs/base.yaml
+.remote-dev/bin/remote-run 'cd subdir && python train.py 2>&1 | tee run.log'
 .remote-dev/bin/remote-logs train 200
 .remote-dev/bin/remote-shell
+.remote-dev/bin/remote-forward 8888
+.remote-dev/bin/remote-forward -f 6006:6006
 ```
 
 Foreground `remote-run` automatically pulls existing allowlisted files after a successful command:
@@ -144,25 +149,25 @@ REMOTE_PULL_PATHS=(pyproject.toml uv.lock configs/deps.toml)
 For first-time setup with passwords or server details, use:
 
 ```bash
-python3 ~/.codex/skills/remote-dev/scripts/configure_remote_dev.py --repo /absolute/path/to/project
+python3 <this-skill-dir>/scripts/configure_remote_dev.py --repo /absolute/path/to/project
 ```
 
-The command shown to the user should be copy-paste friendly from a new terminal, so prefer an absolute `--repo` path. A `cd` form is also acceptable when it includes an absolute path:
+Use the path this skill is installed at for the current agent (Codex: `~/.codex/skills/remote-dev`; Claude Code: `~/.claude/skills/remote-dev`; Hermes: `~/.hermes/skills/autonomous-ai-agents/remote-dev`). The command shown to the user should be copy-paste friendly from a new terminal, so prefer an absolute `--repo` path. A `cd` form is also acceptable when it includes an absolute path:
 
 ```bash
-cd /absolute/path/to/project && python3 ~/.codex/skills/remote-dev/scripts/configure_remote_dev.py --repo .
+cd /absolute/path/to/project && python3 <this-skill-dir>/scripts/configure_remote_dev.py --repo .
 ```
 
 Run that command in a local terminal when entering a server password. If the project is not a Git repository, the script prompts before running local `git init`. It then asks for server hostname/IP, SSH port, user, and remote project directory. It automatically detects matching `~/.ssh/config` entries by `HostName` + `Port` + `User`; if passwordless SSH already works, it reuses the existing config. Otherwise it uses or creates a local SSH key, installs only the public key on the server with `ssh-copy-id`, writes a VS Code compatible `~/.ssh/config` Host, then scaffolds `.remote-dev/bin/*` for the project.
 
-Use the generated SSH Host alias for terminal SSH and VS Code Remote-SSH, for example `ssh codex-root-example.com-2222`. Raw commands such as `ssh -p 2222 root@example.com` may still prompt because OpenSSH matches config blocks by the `Host` argument, not by `HostName` plus port.
+Use the generated SSH Host alias for terminal SSH and VS Code Remote-SSH, for example `ssh remote-dev-root-example.com-2222`. Raw commands such as `ssh -p 2222 root@example.com` may still prompt because OpenSSH matches config blocks by the `Host` argument, not by `HostName` plus port.
 
 If the user wants the raw command to be passwordless too, add a port-specific `Match` block instead of a broad `Host example.com` block:
 
 ```sshconfig
 Match originalhost example.com exec "test %p = 2222"
   User root
-  IdentityFile ~/.ssh/codex_remote_dev_root_example.com_2222
+  IdentityFile ~/.ssh/remote_dev_root_example.com_2222
   IdentitiesOnly yes
 ```
 

@@ -14,21 +14,8 @@ HELPER_DIR = ".remote-dev"
 BIN_DIR = ".remote-dev/bin"
 CONFIG_PATH = ".remote-dev/config"
 CONFIG_EXAMPLE_PATH = ".remote-dev/config.example"
-
-
-REMOTEIGNORE = """\
-# Optional extra excludes for legacy/manual rsync-style operations.
-# Default upload is driven by Git's tracked/unignored file view.
-.hermes/
-.codex/
-.claude/
-.agents/
-.remote-dev/
-.remote-dev.env
-.remoteignore
-AGENTS.md
-CLAUDE.md
-"""
+VERSION_PATH = ".remote-dev/version"
+SCAFFOLD_VERSION = "1.3.1"
 
 
 REMOTE_SYNC = """\
@@ -40,6 +27,8 @@ ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONFIG="${REMOTE_DEV_CONFIG:-$ROOT/.remote-dev/config}"
 DRY_RUN=0
 DELETE=0
+ASSUME_YES=0
+DELETE_PENDING=0
 CACHE_DIR="$ROOT/.remote-dev/cache"
 MANIFEST_Z="$CACHE_DIR/sync-files.z"
 MANIFEST="$CACHE_DIR/sync-files.txt"
@@ -49,7 +38,10 @@ REMOVED="$CACHE_DIR/sync-files.removed.txt"
 usage() {
   cat <<'USAGE'
 Usage:
-  .remote-dev/bin/remote-sync [--dry-run] [--delete]
+  .remote-dev/bin/remote-sync [--dry-run] [--delete [--yes]]
+
+--delete previews the removals and asks for confirmation. In a non-interactive
+run it refuses to delete unless --yes is also given.
 USAGE
 }
 
@@ -61,6 +53,9 @@ filter_manifest() {
         continue
         ;;
     esac
+    if [[ ! -e "$ROOT/$path" && ! -L "$ROOT/$path" ]]; then
+      continue
+    fi
     printf '%s\\0' "$path"
   done
 }
@@ -137,15 +132,43 @@ delete_removed_from_previous_manifest() {
     return
   fi
 
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    while IFS= read -r removed_path; do
+      [[ -z "$removed_path" ]] && continue
+      echo "would delete remote file: $removed_path"
+    done < "$REMOVED"
+    return
+  fi
+
+  # Fail-safe: preview the irreversible deletion and require confirmation.
+  echo "remote-sync --delete will remove these remote files (gone locally since the last sync):" >&2
+  sed 's/^/  /' "$REMOVED" >&2
+  if [[ "$ASSUME_YES" -ne 1 ]]; then
+    if [[ -t 0 ]]; then
+      printf 'Delete %s remote file(s)? [y/N] ' "$(wc -l < "$REMOVED" | tr -d ' ')" >&2
+      read -r reply || reply=""
+      case "$reply" in
+        y|Y|yes|YES) ;;
+        *)
+          echo "Aborted; no files deleted." >&2
+          DELETE_PENDING=1
+          return
+          ;;
+      esac
+    else
+      echo "Refusing to delete in a non-interactive run without --yes." >&2
+      echo "  Preview:  .remote-dev/bin/remote-sync --dry-run --delete" >&2
+      echo "  Confirm:  .remote-dev/bin/remote-sync --delete --yes" >&2
+      DELETE_PENDING=1
+      return
+    fi
+  fi
+
   printf -v REMOTE_ROOT_Q "%q" "$REMOTE_ROOT"
   while IFS= read -r removed_path; do
     [[ -z "$removed_path" ]] && continue
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-      echo "would delete remote file: $removed_path"
-    else
-      printf -v REMOVED_Q "%q" "$removed_path"
-      ssh "${REMOTE_SSH_OPTS[@]}" "$REMOTE_HOST" "cd $REMOTE_ROOT_Q && rm -f -- $REMOVED_Q"
-    fi
+    printf -v REMOVED_Q "%q" "$removed_path"
+    ssh "${REMOTE_SSH_OPTS[@]}" "$REMOTE_HOST" "cd $REMOTE_ROOT_Q && rm -f -- $REMOVED_Q"
   done < "$REMOVED"
 }
 
@@ -157,6 +180,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --delete)
       DELETE=1
+      shift
+      ;;
+    --yes|-y)
+      ASSUME_YES=1
       shift
       ;;
     --help|-h)
@@ -184,6 +211,7 @@ source "$CONFIG"
 if ! declare -p REMOTE_SSH_OPTS >/dev/null 2>&1; then
   REMOTE_SSH_OPTS=(
     -o ServerAliveInterval=30
+    -o ConnectTimeout=10
   )
 fi
 
@@ -205,7 +233,7 @@ rsync "${RSYNC_ARGS[@]}" -e "$SSH_CMD" "$ROOT/" "$REMOTE_HOST:$REMOTE_ROOT/"
 delete_removed_from_previous_manifest
 sync_git_state
 
-if [[ "$DRY_RUN" -eq 0 ]]; then
+if [[ "$DRY_RUN" -eq 0 && "$DELETE_PENDING" -eq 0 ]]; then
   cp "$MANIFEST" "$PREV_MANIFEST"
 fi
 """
@@ -218,7 +246,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONFIG="${REMOTE_DEV_CONFIG:-$ROOT/.remote-dev/config}"
-DRY_RUN_CACHE="$ROOT/.remote-dev/cache/remote-pull-dry-run"
 APPLY=0
 
 usage() {
@@ -269,6 +296,7 @@ source "$CONFIG"
 if ! declare -p REMOTE_SSH_OPTS >/dev/null 2>&1; then
   REMOTE_SSH_OPTS=(
     -o ServerAliveInterval=30
+    -o ConnectTimeout=10
   )
 fi
 
@@ -289,6 +317,10 @@ for opt in "${REMOTE_SSH_OPTS[@]}"; do
 done
 
 printf -v REMOTE_ROOT_Q "%q" "$REMOTE_ROOT"
+
+# Validate every requested path, then resolve which ones exist on the remote in
+# a single SSH round-trip instead of one `ssh test -e` per path.
+REMOTE_LS_ARGS=""
 for path in "$@"; do
   clean_path="${path#/}"
   clean_path="${clean_path#./}"
@@ -297,26 +329,29 @@ for path in "$@"; do
       echo "Refusing whole-tree pull. Pass explicit file paths." >&2
       exit 2
       ;;
+    /*|..|../*|*/..|*/../*)
+      echo "Refusing path that escapes the remote project root: $path" >&2
+      exit 2
+      ;;
     .git|.git/*|.remote-dev|.remote-dev/*|.remoteignore|AGENTS.md|CLAUDE.md|.hermes|.hermes/*|.codex|.codex/*|.claude|.claude/*|.agents|.agents/*)
       echo "Refusing to pull local-control path: $clean_path" >&2
       exit 2
       ;;
   esac
   printf -v CLEAN_PATH_Q "%q" "$clean_path"
-  if ! ssh "${REMOTE_SSH_OPTS[@]}" "$REMOTE_HOST" "test -e $REMOTE_ROOT_Q/$CLEAN_PATH_Q"; then
-    continue
-  fi
+  REMOTE_LS_ARGS+=" $CLEAN_PATH_Q"
+done
 
+EXISTING="$(ssh "${REMOTE_SSH_OPTS[@]}" "$REMOTE_HOST" "cd $REMOTE_ROOT_Q && ls -d1 --$REMOTE_LS_ARGS 2>/dev/null" || true)"
+
+while IFS= read -r clean_path; do
+  [[ -z "$clean_path" ]] && continue
   dest="$ROOT/$clean_path"
   if [[ "$APPLY" -eq 1 ]]; then
     mkdir -p "$ROOT/$(dirname "$clean_path")"
-  elif [[ ! -d "$ROOT/$(dirname "$clean_path")" ]]; then
-    dest="$DRY_RUN_CACHE/$clean_path"
-    mkdir -p "$(dirname "$dest")"
   fi
-
   rsync "${RSYNC_ARGS[@]}" -e "$SSH_CMD" "$REMOTE_HOST:$REMOTE_ROOT/$clean_path" "$dest"
-done
+done <<< "$EXISTING"
 """
 
 
@@ -361,6 +396,9 @@ filter_manifest() {
         continue
         ;;
     esac
+    if [[ ! -e "$ROOT/$path" && ! -L "$ROOT/$path" ]]; then
+      continue
+    fi
     printf '%s\\0' "$path"
   done
 }
@@ -462,6 +500,7 @@ source "$CONFIG"
 if ! declare -p REMOTE_SSH_OPTS >/dev/null 2>&1; then
   REMOTE_SSH_OPTS=(
     -o ServerAliveInterval=30
+    -o ConnectTimeout=10
   )
 fi
 
@@ -620,7 +659,7 @@ mkdir -p "$HOOK_DIR"
 install_hook() {
   local hook_name="$1"
   local hook_path="$HOOK_DIR/$hook_name"
-  local marker="codex-remote-dev git-sync hook"
+  local marker="remote-dev git-sync hook"
 
   if [[ -e "$hook_path" ]] && ! grep -q "$marker" "$hook_path" 2>/dev/null; then
     echo "skipped existing unmanaged hook: $hook_path" >&2
@@ -682,6 +721,11 @@ Usage:
   .remote-dev/bin/remote-run [--no-sync] [--no-pull] [--tty] <command...>
   .remote-dev/bin/remote-run [--no-sync] --screen <session> -- <command...>
   .remote-dev/bin/remote-run [--no-sync] --tmux <session> -- <command...>
+
+A single quoted argument runs as a remote shell command (operators allowed):
+  .remote-dev/bin/remote-run 'cd sub && python train.py 2>&1 | tee run.log'
+Multiple arguments run literally, without shell interpretation:
+  .remote-dev/bin/remote-run python train.py --epochs 3
 USAGE
 }
 
@@ -759,6 +803,7 @@ source "$CONFIG"
 if ! declare -p REMOTE_SSH_OPTS >/dev/null 2>&1; then
   REMOTE_SSH_OPTS=(
     -o ServerAliveInterval=30
+    -o ConnectTimeout=10
   )
 fi
 
@@ -789,7 +834,11 @@ if ! declare -p REMOTE_PULL_PATHS >/dev/null 2>&1; then
 fi
 
 printf -v REMOTE_ROOT_Q "%q" "$REMOTE_ROOT"
-printf -v CMD_Q "%q " "$@"
+if [[ $# -eq 1 ]]; then
+  CMD_Q="$1"
+else
+  printf -v CMD_Q "%q " "$@"
+fi
 REMOTE_INIT="${REMOTE_INIT:-}"
 REMOTE_USE_PROJECT_ENV="${REMOTE_USE_PROJECT_ENV:-1}"
 if [[ "$REMOTE_USE_PROJECT_ENV" == "0" ]]; then
@@ -858,13 +907,18 @@ source "$CONFIG"
 if ! declare -p REMOTE_SSH_OPTS >/dev/null 2>&1; then
   REMOTE_SSH_OPTS=(
     -o ServerAliveInterval=30
+    -o ConnectTimeout=10
   )
 fi
 
 printf -v REMOTE_ROOT_Q "%q" "$REMOTE_ROOT"
 
 if [[ $# -gt 0 ]]; then
-  printf -v CMD_Q "%q " "$@"
+  if [[ $# -eq 1 ]]; then
+    CMD_Q="$1"
+  else
+    printf -v CMD_Q "%q " "$@"
+  fi
   REMOTE_INIT="${REMOTE_INIT:-}"
   REMOTE_USE_PROJECT_ENV="${REMOTE_USE_PROJECT_ENV:-1}"
   if [[ "$REMOTE_USE_PROJECT_ENV" == "0" ]]; then
@@ -921,6 +975,7 @@ source "$CONFIG"
 if ! declare -p REMOTE_SSH_OPTS >/dev/null 2>&1; then
   REMOTE_SSH_OPTS=(
     -o ServerAliveInterval=30
+    -o ConnectTimeout=10
   )
 fi
 
@@ -931,6 +986,81 @@ LOG_PATH="logs/${SESSION}.log"
 printf -v LOG_Q "%q" "$LOG_PATH"
 
 ssh "${REMOTE_SSH_OPTS[@]}" "$REMOTE_HOST" "cd $REMOTE_ROOT_Q && if [[ -f $LOG_Q ]]; then tail -n $LINES_Q $LOG_Q; elif command -v tmux >/dev/null 2>&1 && tmux has-session -t $SESSION_Q 2>/dev/null; then tmux capture-pane -pt $SESSION_Q -S -$LINES_Q; else echo 'No screen/tmux log found for: $SESSION' >&2; exit 2; fi"
+"""
+
+
+REMOTE_FORWARD = """\
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CONFIG="${REMOTE_DEV_CONFIG:-$ROOT/.remote-dev/config}"
+BACKGROUND=0
+
+usage() {
+  cat <<'USAGE'
+Forward a local port to a service running on the remote host (Jupyter,
+TensorBoard, a dev server, an API, etc.).
+
+Usage:
+  .remote-dev/bin/remote-forward [-f] PORT               # local PORT  -> remote localhost:PORT
+  .remote-dev/bin/remote-forward [-f] LPORT:RPORT        # local LPORT -> remote localhost:RPORT
+  .remote-dev/bin/remote-forward [-f] LPORT:RHOST:RPORT  # local LPORT -> RHOST:RPORT via remote
+
+  -f   run in the background (ssh -fN); prints how to stop it.
+Without -f the tunnel stays in the foreground; press Ctrl-C to stop it.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f|--background) BACKGROUND=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) usage >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+
+SPEC="${1:-}"
+if [[ -z "$SPEC" ]]; then
+  usage >&2
+  exit 2
+fi
+
+if [[ ! -f "$CONFIG" ]]; then
+  echo "Missing remote config: $CONFIG" >&2
+  exit 2
+fi
+
+# shellcheck source=/dev/null
+source "$CONFIG"
+: "${REMOTE_HOST:?Set REMOTE_HOST in .remote-dev/config}"
+
+if ! declare -p REMOTE_SSH_OPTS >/dev/null 2>&1; then
+  REMOTE_SSH_OPTS=(
+    -o ServerAliveInterval=30
+    -o ConnectTimeout=10
+  )
+fi
+
+case "$SPEC" in
+  *:*:*) FWD="$SPEC" ;;
+  *:*)   FWD="${SPEC%%:*}:localhost:${SPEC##*:}" ;;
+  *)     FWD="$SPEC:localhost:$SPEC" ;;
+esac
+LPORT="${FWD%%:*}"
+
+echo "Forwarding local 127.0.0.1:$LPORT -> $REMOTE_HOST ($FWD)"
+if [[ "$BACKGROUND" -eq 1 ]]; then
+  ssh -fN -L "127.0.0.1:$FWD" "${REMOTE_SSH_OPTS[@]}" "$REMOTE_HOST"
+  echo "Tunnel running in background (ssh -fN)."
+  echo "Stop it with:  pkill -f 'ssh.*-L 127.0.0.1:$FWD'"
+else
+  echo "Foreground tunnel; press Ctrl-C to stop."
+  exec ssh -N -L "127.0.0.1:$FWD" "${REMOTE_SSH_OPTS[@]}" "$REMOTE_HOST"
+fi
 """
 
 
@@ -947,18 +1077,20 @@ This repository is edited locally and runs on an SSH host. The remote checkout i
 - Remote project commands must run from the remote project directory. The generated tools `cd` to `REMOTE_ROOT` before running project commands.
 - Remote project-local environments are preferred automatically: if `.venv/bin`, `venv/bin`, or `node_modules/.bin` exists under `REMOTE_ROOT`, it is prepended to `PATH` before the command runs. Set `REMOTE_USE_PROJECT_ENV=0` in `.remote-dev/config` to disable.
 - Use `.remote-dev/bin/remote-sync` before remote tests, builds, training runs, or service runs. Default sync uploads Git tracked files plus unignored untracked files, then syncs local `.git/` to the remote.
-- `.remote-dev/bin/remote-sync --delete` removes only remote files that were present in the previous local sync manifest and are now gone locally. Always dry-run first with `.remote-dev/bin/remote-sync --dry-run --delete`.
+- `.remote-dev/bin/remote-sync --delete` removes only remote files that were present in the previous local sync manifest and are now gone locally. It prints the deletion list and asks for confirmation; in a non-interactive run it refuses to delete unless `--yes` is given. Preview first with `.remote-dev/bin/remote-sync --dry-run --delete`.
 - Create or modify runtime environments only on the remote host via `.remote-dev/bin/remote-run`. This includes `uv`, `pip`, `conda`, `npm`, virtualenv creation, dependency installs/upgrades/removals, and lockfile generation. Do not create local `.venv` or install project dependencies locally unless explicitly requested.
 - Foreground `.remote-dev/bin/remote-run` auto-pulls common metadata/lock files changed by remote tooling, such as `pyproject.toml` and `uv.lock`. Use `--no-pull` to disable or `REMOTE_PULL_PATHS=(...)` in `.remote-dev/config` to customize.
 - Use `.remote-dev/bin/remote-pull [path ...]` for manual dry-run remote-to-local pulls; add `--apply` after reviewing.
 - Use `.remote-dev/bin/remote-audit` before the first sync to an existing or unknown remote project directory. Its path/name categories are heuristic candidates only. If it reports content drift or remote-only candidates, summarize the files and get user approval before pulling, syncing, editing ignore rules, or deleting.
 - Use `.remote-dev/bin/remote-run <command>` for commands that need remote datasets, GPUs, services, or credentials.
+- For a command with shell operators (`&&`, `|`, `>`, `;`), pass it as one quoted argument: `.remote-dev/bin/remote-run 'cd sub && python train.py 2>&1 | tee run.log'`. Multiple unquoted arguments are run literally, without shell interpretation.
 - Use `.remote-dev/bin/remote-run --screen <session> -- <command>` for long-running jobs. Use `--tmux` only for legacy tmux sessions.
 - Use `.remote-dev/bin/remote-logs <session> [lines]` to inspect long-running output.
+- To use a remote service from the local machine (Jupyter, TensorBoard, dev server, API), forward a port: `.remote-dev/bin/remote-forward 8888` maps local 127.0.0.1:8888 to remote localhost:8888; add `-f` to background the tunnel.
 - Treat `.remote-dev/config` as local private configuration. Do not print it or paste its contents unless debugging requires it.
-- Keep local control files local: `.remote-dev/`, `.remoteignore`, `.hermes/`, `AGENTS.md`, and `CLAUDE.md` are not uploaded to the remote and should be ignored by local Git.
+- Keep agent control files local: `.remote-dev/`, `.hermes/`, `.codex/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` are never uploaded to the remote (always filtered from the sync manifest) and should also be ignored by local Git. This keeps local agent history and notes off the server even if `.gitignore` is later changed.
 - Represent remote-only directories locally with empty placeholder directories. When a project uses a remote-only directory, create the empty local directory with `.gitkeep` or a similar placeholder and add matching `.gitignore` rules such as `path/*` and `!path/.gitkeep`.
-- Put datasets, environment directories, caches, logs, checkpoints, and generated artifacts in `.gitignore`. Do not rely on `.remoteignore` as the main safety mechanism.
+- Put datasets, environment directories, caches, logs, checkpoints, and generated artifacts in `.gitignore`. That is the primary mechanism that keeps remote-only data off the local checkout and out of the upload manifest.
 - When installing or downloading dependencies on the remote server, assume public internet may be blocked or slow. Prefer existing configured mirrors first; otherwise use China-accessible mirrors such as Aliyun, Tsinghua, USTC, or HuaweiCloud, or a user-provided transit host.
 """
 
@@ -989,7 +1121,7 @@ def append_once(path: Path, marker: str, content: str) -> str:
 def tracked_local_control_files(repo: Path) -> list[str]:
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo), "ls-files", "--", ".remote-dev", ".remoteignore", ".hermes", "AGENTS.md", "CLAUDE.md"],
+            ["git", "-C", str(repo), "ls-files", "--", ".remote-dev", ".hermes", ".codex", ".claude", ".agents", "AGENTS.md", "CLAUDE.md"],
             text=True,
             capture_output=True,
             check=False,
@@ -1009,6 +1141,7 @@ REMOTE_HOST={host_value}
 REMOTE_ROOT={root_value}
 REMOTE_SSH_OPTS=(
   -o ServerAliveInterval=30
+  -o ConnectTimeout=10
 )
 # Prefer project-local remote environments under REMOTE_ROOT:
 # .venv/bin, venv/bin, and node_modules/.bin.
@@ -1023,7 +1156,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--repo", default=".", help="repository root to update")
     parser.add_argument("--host", help="SSH config alias or host")
     parser.add_argument("--remote-root", help="remote repository path")
-    parser.add_argument("--force", action="store_true", help="overwrite existing generated files")
+    parser.add_argument("--force", action="store_true", help="overwrite all generated files, including .remote-dev/config")
+    parser.add_argument("--force-helpers", action="store_true", help="overwrite generated helpers and config.example but keep .remote-dev/config")
     parser.add_argument("--no-agents", action="store_true", help="do not append AGENTS.md or CLAUDE.md guidance")
     args = parser.parse_args(argv)
 
@@ -1033,29 +1167,37 @@ def main(argv: list[str]) -> int:
     if not repo.is_dir():
         parser.error(f"repo is not a directory: {repo}")
 
+    force_helpers = args.force or args.force_helpers
+    force_config = args.force
+
     results = []
-    results.append(write_file(repo / ".remoteignore", REMOTEIGNORE, False, args.force))
-    results.append(write_file(repo / CONFIG_EXAMPLE_PATH, make_env(args.host, args.remote_root), False, args.force))
+    results.append(write_file(repo / CONFIG_EXAMPLE_PATH, make_env(args.host, args.remote_root), False, force_helpers))
 
     config_path = repo / CONFIG_PATH
     if args.host and args.remote_root:
-        results.append(write_file(config_path, make_env(args.host, args.remote_root), False, args.force))
+        results.append(write_file(config_path, make_env(args.host, args.remote_root), False, force_config))
     elif not config_path.exists():
         results.append("skipped .remote-dev/config because --host or --remote-root is missing")
 
-    results.append(write_file(repo / BIN_DIR / "remote-sync", REMOTE_SYNC, True, args.force))
-    results.append(write_file(repo / BIN_DIR / "remote-pull", REMOTE_PULL, True, args.force))
-    results.append(write_file(repo / BIN_DIR / "remote-audit", REMOTE_AUDIT, True, args.force))
-    results.append(write_file(repo / BIN_DIR / "install-git-hooks", INSTALL_GIT_HOOKS, True, args.force))
-    results.append(write_file(repo / BIN_DIR / "remote-run", REMOTE_RUN, True, args.force))
-    results.append(write_file(repo / BIN_DIR / "remote-shell", REMOTE_SHELL, True, args.force))
-    results.append(write_file(repo / BIN_DIR / "remote-logs", REMOTE_LOGS, True, args.force))
+    results.append(write_file(repo / BIN_DIR / "remote-sync", REMOTE_SYNC, True, force_helpers))
+    results.append(write_file(repo / BIN_DIR / "remote-pull", REMOTE_PULL, True, force_helpers))
+    results.append(write_file(repo / BIN_DIR / "remote-audit", REMOTE_AUDIT, True, force_helpers))
+    results.append(write_file(repo / BIN_DIR / "install-git-hooks", INSTALL_GIT_HOOKS, True, force_helpers))
+    results.append(write_file(repo / BIN_DIR / "remote-run", REMOTE_RUN, True, force_helpers))
+    results.append(write_file(repo / BIN_DIR / "remote-shell", REMOTE_SHELL, True, force_helpers))
+    results.append(write_file(repo / BIN_DIR / "remote-logs", REMOTE_LOGS, True, force_helpers))
+    results.append(write_file(repo / BIN_DIR / "remote-forward", REMOTE_FORWARD, True, force_helpers))
+
+    version_file = repo / VERSION_PATH
+    version_file.parent.mkdir(parents=True, exist_ok=True)
+    version_file.write_text(SCAFFOLD_VERSION + "\n", encoding="utf-8")
+    results.append(f"wrote {version_file} ({SCAFFOLD_VERSION})")
 
     results.append(
         append_once(
             repo / ".gitignore",
             "# remote-dev local control files",
-            "# remote-dev local control files\n.remote-dev/\n.remoteignore\n.hermes/\nAGENTS.md\nCLAUDE.md",
+            "# remote-dev local control files\n.remote-dev/\n.hermes/\nAGENTS.md\nCLAUDE.md",
         )
     )
     tracked_control = tracked_local_control_files(repo)

@@ -1,7 +1,7 @@
 ---
 name: remote-dev
 description: Local Hermes/Codex/Claude Code + local Git with remote SSH runtime. Use when the user says "我要远程开发", "远程开发", "在服务器上跑", or mentions SSH/rsync/remote-run/screen, restricted server internet/mirrors, datasets/GPU/services on a server, or keeping the local agent's history/edits local.
-version: 1.0.0
+version: 1.3.1
 author: Hermes Agent
 license: MIT
 metadata:
@@ -16,9 +16,9 @@ Keep the local agent (Hermes, Codex and/or Claude Code), chat, and editing on th
 ## Workflow
 
 - If `.remote-dev/bin/remote-run` exists, use `.remote-dev/bin/*` for remote work. Legacy `tools/remote-*` is allowed only when already present.
-- If unconfigured and the user wants remote development, output a copy-paste safe local setup command with an absolute repo path:
+- If unconfigured and the user wants remote development, output a copy-paste safe local setup command that runs this skill's own `scripts/configure_remote_dev.py` with an absolute repo path. Use the install path for the current agent (Codex: `~/.codex/skills/remote-dev`; Claude Code: `~/.claude/skills/remote-dev`; Hermes: `~/.hermes/skills/autonomous-ai-agents/remote-dev`):
   ```bash
-  python3 ~/.codex/skills/remote-dev/scripts/configure_remote_dev.py --repo /absolute/path/to/project
+  python3 <this-skill-dir>/scripts/configure_remote_dev.py --repo /absolute/path/to/project
   ```
   Do not output `--repo .` unless the user explicitly wants to run it from the project directory. If the current directory is a workspace parent and the target project is ambiguous, ask for the exact subproject path. The setup script asks only for an SSH target or Host alias (for example `root@1.2.3.4:22`) and the remote project directory unless SSH itself prompts for a password while installing the public key. It initializes local Git when needed, creates/reuses a remote-dev-managed key if passwordless SSH is unavailable, configures raw `ssh -p <port> user@host` passwordless when possible, creates/updates both `AGENTS.md` and `CLAUDE.md` with the same local remote-dev guidance, installs local Git hooks, runs a read-only remote audit, and applies the first non-deleting sync only when the audit finds no remote drift that needs review.
 - Edit files locally. Run Git locally: `status`, `diff`, `add`, `commit`, `branch`, `merge`, `rebase`, `checkout`, `switch`, `pull`, and `push`. Do remote Git only for a single explicit user request.
@@ -26,10 +26,20 @@ Keep the local agent (Hermes, Codex and/or Claude Code), chat, and editing on th
 - Sync before remote execution with `.remote-dev/bin/remote-sync` unless the helper already does it.
 - Before the first sync to a non-empty or unknown remote project directory, run a read-only drift audit with `.remote-dev/bin/remote-audit` when available. If local and remote code differ, summarize the concrete differences and ask the user which direction to take before applying changes.
 - After the agent (Hermes/Codex/Claude Code) changes local Git state, run `.remote-dev/bin/remote-sync` before continuing. This includes successful local commit/merge/rebase/checkout/switch/pull and successful push. Generated hooks may also sync manual Git; `pre-push` is best effort because Git has no standard `post-push`.
+- Run a command with shell operators (`&&`, `|`, `>`, `;`) by passing it as one quoted argument; multiple unquoted arguments run literally without shell interpretation:
+  ```bash
+  .remote-dev/bin/remote-run 'cd sub && python train.py 2>&1 | tee run.log'
+  .remote-dev/bin/remote-run python train.py --epochs 3
+  ```
 - Keep output compact. For long jobs, use `screen`:
   ```bash
   .remote-dev/bin/remote-run --screen train -- python train.py
   .remote-dev/bin/remote-logs train 200
+  ```
+- Reach a remote service (Jupyter, TensorBoard, dev server, API) from the local machine by forwarding a port:
+  ```bash
+  .remote-dev/bin/remote-forward 8888         # local 127.0.0.1:8888 -> remote localhost:8888
+  .remote-dev/bin/remote-forward -f 6006:6006 # background tunnel
   ```
 
 ## Existing Remote Code / Drift Handling
@@ -43,12 +53,13 @@ Keep the local agent (Hermes, Codex and/or Claude Code), chat, and editing on th
 
 ## Sync Model
 
-- `remote-sync` uploads the Git view: tracked files plus unignored untracked files, while filtering local control paths such as `.remote-dev/`, `.remoteignore`, `.hermes/`, `AGENTS.md`, `CLAUDE.md`, `.codex/`, `.claude/`, and `.agents/`.
-- `.remote-dev/`, `.remoteignore`, `.hermes/`, `AGENTS.md`, and `CLAUDE.md` are local-only, should be ignored by local Git, and must not be uploaded.
+- `remote-sync` uploads the Git view: tracked files plus unignored untracked files, while filtering local control paths `.remote-dev/`, `.hermes/`, `.codex/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` from the upload.
+- `.remote-dev/`, `.hermes/`, `.codex/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` are local-only: always filtered from the upload manifest and ignored by local Git, so local notes and agent history never reach the remote even if `.gitignore` changes.
 - Local `.git/` is synced separately so remote runtime tools can read version state. The remote `.git/` is a runtime copy, not the default place for Git decisions.
-- `remote-sync` is non-deleting by default. Use `--delete` only after `.remote-dev/bin/remote-sync --dry-run --delete` and explicit confirmation; deletion is limited to files from the previous local sync manifest.
+- `remote-sync` is non-deleting by default. `--delete` previews the removals and asks for confirmation, and refuses in non-interactive runs unless `--yes` is passed; deletion is limited to files from the previous local sync manifest. Preview with `.remote-dev/bin/remote-sync --dry-run --delete`.
+- `remote-pull` confines reads to the remote project root: it refuses absolute paths and any path containing `..`, so a pull cannot reach files outside `REMOTE_ROOT` (for example `../.ssh/id_rsa`).
 - Remote-only directories that are confirmed to be data/artifact/env directories should exist locally as empty placeholders, usually with `.gitkeep`, and their contents should be ignored in `.gitignore`. Do not treat a path as confirmed solely because its name matches a pattern.
-- Do not rely on `.remoteignore` as the primary safety mechanism; use `.gitignore` for data, environments, caches, logs, checkpoints, and artifacts.
+- Use `.gitignore` as the primary safety mechanism for data, environments, caches, logs, checkpoints, and artifacts.
 - Never run blind bidirectional sync. Foreground `remote-run` only auto-pulls allowlisted metadata/lock files; `remote-pull` requires explicit paths.
 
 ## Remote Runtime
