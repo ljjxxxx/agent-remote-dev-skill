@@ -1,15 +1,11 @@
 ---
 name: remote-dev
 description: Local Hermes/Codex/Claude Code + local Git with remote SSH runtime. Use when the user says "我要远程开发", "远程开发", "在服务器上跑", or mentions SSH/rsync/remote-run/screen, restricted server internet/mirrors, datasets/GPU/services on a server, or keeping the local agent's history/edits local.
-version: 1.3.1
-author: Hermes Agent
-license: MIT
-metadata:
-  hermes:
-    tags: [remote-development, ssh, rsync, hermes, codex, claude-code]
-    related_skills: [hermes-agent, codex, claude-code]
 ---
 # Remote Dev
+
+<!-- skill version 1.3.1; see README and Git history. Frontmatter is intentionally limited to name + description for cross-agent compatibility (Codex requires only those two fields; Claude Code and Hermes accept them). Do not add version/author/license/metadata back to the frontmatter. -->
+
 
 Keep the local agent (Hermes, Codex and/or Claude Code), chat, and editing on this machine; use SSH only for runtime. The same project may use Hermes, Codex and Claude Code together — `.hermes/`, `.codex/`, and `.claude/` are local-only. Never ask for passwords or secrets in chat.
 
